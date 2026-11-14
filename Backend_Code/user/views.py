@@ -1,0 +1,913 @@
+from django.shortcuts import render
+
+# Create your views here.
+import requests
+from rest_framework.filters import SearchFilter, OrderingFilter
+from user.models import User
+from rest_framework_simplejwt.authentication import JWTAuthentication
+from rest_framework.viewsets import ModelViewSet
+from user.serializers import UserSerializer, RegisterSerializer, OtpSerilaizer
+from utils.pagination import mypagination
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.response import Response
+from rest_framework.decorators import action
+import threading
+from utils.send_mail import send_email_with_template
+from django.db import transaction
+from utils.generate_otp import generate_otp, generate_token, decode_token
+from rest_framework_simplejwt.tokens import RefreshToken
+from course.models import Course
+from faker import Faker
+
+# from rest_framework_simplejwt.tokens import OutstandingToken, BlacklistedToken
+
+from rest_framework_simplejwt.token_blacklist.models import (
+    OutstandingToken,
+    BlacklistedToken,
+)
+
+from datetime import datetime
+from rest_framework import status
+from decouple import config
+from django.contrib.auth.hashers import check_password
+import json
+faker = Faker()
+
+from uuid import uuid4
+class UserViewSet(ModelViewSet):
+    queryset = User.objects.filter(deleted=0,email_verified=True).order_by("-id")
+    serializer_class = UserSerializer
+    pagination_class = mypagination
+    filter_backends = [SearchFilter, OrderingFilter]
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    search_fields = ["username", "email","type","gender","dob","bio"]
+    ordering_fields = ["username", "email","type","gender","dob","bio"]
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        no_pagination = request.query_params.get("no_pagination")
+
+        if no_pagination:
+            serializer = self.serializer_class(queryset, many=True)
+            return Response(
+                {"success": True, "data": serializer.data}, status=status.HTTP_200_OK
+            )
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.serializer_class(page, many=True)
+            return self.get_paginated_response(
+                {"success": True, "data": serializer.data}
+            )
+
+        serializer = self.serializer_class(queryset, many=True)
+        return Response(
+            {"success": True, "data": serializer.data}, status=status.HTTP_200_OK
+        )
+        
+    def create(self,request,*args,**kwargs):
+        data = json.loads(request.data.get("form_data"))
+        profile_picture = request.FILES.get('profile_picture')
+        user_12th_marsheet_image = request.FILES.get('user_12th_marsheet_image')
+        user_degree_certificate = request.FILES.get('user_degree_certificate')
+        
+        data["profile_picture"] = profile_picture
+        data["user_degree_certificate"]=user_degree_certificate
+        data["user_12th_marsheet_image"]=user_12th_marsheet_image
+        
+        data["user_uuid"]=str(uuid4())
+        serializer = self.serializer_class(data=data, partial=True)
+
+        if serializer.is_valid():
+            serializer.save()
+            return Response(
+                {
+                    "success": True,
+                    "message": "Successfully Created",
+                    "data": serializer.data,
+                },
+                status=status.HTTP_200_OK,
+            )
+        else:
+            errors_message = " ".join(
+                [", ".join(value) for value in serializer.errors.values()]
+            )
+            return Response(
+                {"success": False, "message": errors_message},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+
+        data = json.loads(request.data.get("form_data"))
+
+        profile_picture = request.FILES.get('profile_picture')
+        user_12th_marsheet_image = request.FILES.get('user_12th_marsheet_image')
+        user_degree_certificate = request.FILES.get('user_degree_certificate')
+        
+        if user_12th_marsheet_image:
+            data["user_12th_marsheet_image"]=user_12th_marsheet_image
+            
+        if user_degree_certificate:
+            data["user_degree_certificate"]=user_degree_certificate
+            
+        if profile_picture:
+            data["profile_picture"] = profile_picture
+            
+        
+        data["updated_at"]=datetime.now()
+        serializer = self.serializer_class(instance=instance, data=data, partial=True)
+
+        if serializer.is_valid():
+            serializer.save()
+            
+            return Response(
+                {
+                    "success": True,
+                    "message": "Successfully Updated",
+                    "data": serializer.data,
+                },
+                status=status.HTTP_200_OK,
+            )
+        else:
+            print(serializer.errors)
+            errors_message = " ".join(
+                [", ".join(value) for value in serializer.errors.values()]
+            )
+            return Response(
+                {"success": False, "message": errors_message},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+
+        
+
+    @action(detail=False, methods=["post"])
+    def logout(self, request, *args, **kwargs):
+        try:
+            # Get the token from the request body
+            token = request.data.get("refresh_token")
+            print("Refresh token received:", token)
+
+            if token:
+                try:
+                    refresh_token = RefreshToken(token)
+
+                    user_id = refresh_token.payload.get("user_id")
+                    user = User.objects.filter(id=user_id).first()
+
+                    if user:
+                        # user.is_active = False
+                        user.save()
+
+                        return Response(
+                            {
+                                "success": True,
+                                "message": "User logged out and deactivated successfully.",
+                            },
+                            status=status.HTTP_200_OK,
+                        )
+                    else:
+                        return Response(
+                            {
+                                "success": False,
+                                "message": "User not found or invalid token.",
+                            },
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                except Exception as e:
+                    print("Error during logout:", e)
+                    return Response(
+                        {
+                            "success": False,
+                            "message": "Error processing token. Try again.",
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            else:
+                return Response(
+                    
+                    {"success": False, "message": "Token not provided."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        except Exception as e:
+            print("Unexpected error:", e)
+            return Response(
+                {"success": False, "message": "An unexpected error occurred."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @action(detail=False, methods=["GET"], url_path="get-user-single")
+    def get_user_single(self, request, *args, **kwargs):
+        try:
+            instance = User.objects.get(id=request.user.id)  # Get the user by ID
+        except User.DoesNotExist:
+            return Response(
+                {"detail": "User not found"}, status=status.HTTP_404_NOT_FOUND
+            )
+
+        if not instance.is_active:
+            return Response(
+                {"detail": "User is not active"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if instance:
+            serializer = UserSerializer(instance)
+            return Response(
+                {"success": True, "data": serializer.data}, status=status.HTTP_200_OK
+            )
+        else:
+            return Response(
+                {"success": False, "message": "No user found ! Please login again"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    @action(detail=False, methods=["GET"], url_path="get-user-multiple")
+    def get_user_multiple(self, request, *args, **kwargs):
+        instance = request.user
+        if instance.is_superuser:
+            data = User.objects.all()
+            serializer = UserSerializer(data=data, many=True)
+            return Response(
+                {"success": True, "data": serializer.data}, status=status.HTTP_200_OK
+            )
+        else:
+            return Response(
+                {"success": False, "message": "You are not admin"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+            
+    @action(detail=False,methods=["GET"],url_path="dashboared-api")
+    def dashboared_api(self,request,*args,**kwargs):
+        user=request.user
+        print(request.user.is_superuser)
+        if not user.is_superuser:
+            return Response({"success":False,"message":"Only Admin can access this api"},status=status.HTTP_400_BAD_REQUEST)
+        
+        teachers=User.objects.filter(type="Teacher").count()
+        students=User.objects.filter(type="Student").count()
+        courses=Course.objects.all().count()
+        
+        data={
+            "total_teacher":teachers,
+            "total_student":students,
+            "total_courses":courses
+        }
+        
+        return Response({"success":True,"data":data},status=status.HTTP_200_OK)
+        
+
+
+class UserArchiveViewset(ModelViewSet):
+    queryset = User.objects.filter(deleted=1,email_verified=True).order_by("-id")
+    serializer_class = UserSerializer
+    pagination_class = mypagination
+    filter_backends = [SearchFilter, OrderingFilter]
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    search_fields = ["username", "email","type"]
+    ordering_fields = ["username", "email","type"]    
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        no_pagination = request.query_params.get("no_pagination")
+
+        if no_pagination:
+            serializer = self.serializer_class(queryset, many=True)
+            return Response(
+                {"success": True, "data": serializer.data}, status=status.HTTP_200_OK
+            )
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.serializer_class(page, many=True)
+            return self.get_paginated_response(
+                {"success": True, "data": serializer.data}
+            )
+
+        serializer = self.serializer_class(queryset, many=True)
+        return Response(
+            {"success": True, "data": serializer.data}, status=status.HTTP_200_OK
+        )
+        
+    def create(self, request, *args, **kwargs):
+        id=request.data.get("id")
+        if not id:
+           return Response(
+            {"success": True, "message":"id is required"}, status=status.HTTP_400_BAD_REQUEST
+        )
+            
+        try:
+            user_instance=User.objects.get(id=id)
+        except User.DoesNotExist:
+           return Response(
+            {"success": True, "message":"No user with this id"}, status=status.HTTP_400_BAD_REQUEST
+        )
+           
+        user_instance.deleted=1
+        user_instance.save()
+        
+        return Response(
+                {"success": True, "message": "User Successfully Archived"}, status=status.HTTP_200_OK
+            )
+           
+
+class UserRestoreViewset(ModelViewSet):
+    queryset = User.objects.filter(deleted=1,email_verified=True).order_by("-id")
+    serializer_class = UserSerializer
+    pagination_class = mypagination
+    filter_backends = [SearchFilter, OrderingFilter]
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    search_fields = ["username", "email","type"]
+    ordering_fields = ["username", "email","type"]    
+
+    
+    
+    def create(self, request, *args, **kwargs):
+        id=request.data.get("id")
+        if not id:
+           return Response(
+            {"success": True, "message":"id is required"}, status=status.HTTP_400_BAD_REQUEST
+        )
+            
+        try:
+            user_instance=User.objects.get(id=id)
+        except User.DoesNotExist:
+           return Response(
+            {"success": True, "message":"No user with this id"}, status=status.HTTP_400_BAD_REQUEST
+        )
+           
+        user_instance.deleted=0
+        user_instance.save()
+        
+        return Response(
+                {"success": True, "message": "User Successfully Restored"}, status=status.HTTP_200_OK
+            )
+           
+class RegisterViewSet(ModelViewSet):
+    queryset = User.objects.all()
+    serializer_class = RegisterSerializer
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [AllowAny]
+
+    def create(self, request, *args, **kwargs):
+        data=request.data
+        data["user_uuid"]=str(uuid4())
+        print(data)
+        serializer = RegisterSerializer(data=data)
+        if serializer.is_valid():
+            with transaction.atomic():
+                email = serializer.validated_data["email"]
+                user = User.objects.filter(email=email).first()
+
+                if user and not user.email_verified:
+                    # User exists but email is not verified, update OTP and resend email
+                    user.otp = generate_otp()
+                    print(user.otp)
+                    user.save()
+                else:
+                    # Create a new user
+                    user = serializer.save()
+
+                token = generate_token(email, 60)
+                subject = "Email Verification"
+                to = email
+                context = {
+                    "link": f"{config('HOST_URL')}verify-otp/{token}/",
+                    "otp": user.otp,
+                }
+                # send_email_verfication(subject=subject, to=to, context=context)
+                # subject, recipient_email, template_name, context
+                email_thread = threading.Thread(
+                    target=send_email_with_template,
+                    args=(subject, to, "send_otp.html", context),
+                )
+                email_thread.start()
+                return Response(
+                    {
+                        "success": True,
+                        "message": f"Registration successfully done! OTP has been sent on {user.email} for verification.",
+                        "data": serializer.data,
+                        "token": token,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+        else:
+            errors_message = " ".join(
+                [", ".join(value) for value in serializer.errors.values()]
+            )
+            return Response(
+                {"success": False, "message": errors_message},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+
+# @method_decorator(csrf_exempt, name="dispatch")
+class VerifyEmailViewset(ModelViewSet):
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
+
+    @transaction.atomic()
+    def create(self, request, *args, **kwargs):
+        otp = int(request.data.get("otp"))
+        token = request.data.get("token")
+        try:
+            payload = decode_token(token)
+        except Exception:
+            return Response(
+                {"success": False, "message": "Invalid or Expired Links"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if "email" not in payload:
+            return Response(
+                {"success": False, "message": "Invalid Link"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        user = User.objects.filter(email=payload["email"]).first()
+        print(user.otp)
+        if user is None:
+            return Response(
+                {"success": False, "message": "Email is not registered"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if not (user.otp == otp):
+            return Response(
+                {"success": False, "message": "Invalid otp"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        user.email_verified = True
+        refresh_token = RefreshToken.for_user(user)
+        access_token = str(refresh_token.access_token)
+
+        user.otp = otp
+        user.is_active = True
+        user.save()
+
+        serializer=UserSerializer(user)
+        return Response(
+            {
+                "success": True,
+                "message": "Email successfully verified",
+                "data":serializer.data,
+                "token": {
+                    "access_token": access_token,
+                    "refresh_token": str(refresh_token),
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+# class ResendOtpViewSet(ModelViewSet):
+
+#     @transaction.atomic()
+#     def create(self, request, *args, **kwargs):
+#         data=request.data
+#         user = User.objects.filter(email=data.get('email')).first()
+#         if user is None:
+#             return Response(
+#                 {"success": False, "message": "Email is not registered"},
+#                 status=status.HTTP_401_UNAUTHORIZED,
+#             )
+#         otp=generate_otp()
+#         user.otp=otp
+#         user.save()
+#         subject="Otp for verification email"
+#         recipient_email=user.email
+#         template_name="send_otp.html"
+#         context={
+#             "otp":otp
+#         }
+#         mail_thread = threading.Thread(
+#             target=send_email_with_template,
+#             args=(subject, recipient_email, template_name, context)
+#         )
+#         mail_thread.start()
+
+#         return Response(
+#             {"success": True, "message": "An OTP has been sent again to your address."},
+#             status=status.HTTP_200_OK,
+#         )
+
+
+class ResendOtpViewSet(ModelViewSet):
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
+
+    @transaction.atomic()
+    def create(self, request, *args, **kwargs):
+        token = request.data.get("token")
+        try:
+            payload = decode_token(token)
+        except Exception:
+            return Response(
+                {"success": False, "message": "Link Expired"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if "email" not in payload:
+            return Response(
+                {"success": False, "message": "Invalid Link"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        user = User.objects.filter(email=payload["email"]).first()
+        if user is None:
+            return Response(
+                {"success": False, "message": "Email is not registered"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        otp = generate_otp()
+        print(otp)
+
+        user.otp = otp
+        user.save()
+        subject = "Email Verification"
+        to = user.email
+        context = {
+            "link": f"{config('HOST_URL')}verify-otp/{token}/",
+            "otp": user.otp,
+        }
+        print(context)
+        email_thread = threading.Thread(
+            target=send_email_with_template,
+            args=(subject, to, "send_otp.html", context),
+        )
+        email_thread.start()
+
+        return Response(
+            {
+                "success": True,
+                "message": f"An OTP has been sent again to {user.email} .",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class LoginViewSet(ModelViewSet):
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
+
+    @transaction.atomic()
+    def create(self, request, *args, **kwargs):
+        data = request.data
+        email = data.get("email")
+        password = data.get("password")
+
+        try:
+            user = User.objects.get(email=email,is_superuser=False)
+        except User.DoesNotExist:
+            return Response(
+                {"success": False, "message": "Invalid Email or Password"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+            
+        if user.is_active==False:
+             return Response(
+                {"success": False, "message": "Your account has been deactivated by admin"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if check_password(password, user.password) and user.email_verified:
+            user.is_active = True
+            user.save()
+            refresh_token = RefreshToken.for_user(user)
+            access_token = str(refresh_token.access_token)
+
+            return Response(
+                {
+                    "success": True,
+                    "message": "Login successful done",
+                    "token": {
+                        "access_token": access_token,
+                        "refresh_token": str(refresh_token),
+                    },
+                    "data": {
+                        "id": user.id,
+                        "email": user.email,
+                        "type":user.type,
+                        "is_active": user.is_active,
+                        "username": user.username,
+                        "is_superuser":user.is_superuser,
+                        "profile_picture":f'/media/{str(user.profile_picture)}'
+                    },
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        else:
+            return Response(
+                {"success": False, "message": "Invalid Email or Password"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    @action(detail=False, methods=["POST"], url_path="admin-login")
+    def admin_login(self, request, *args, **kwargs):
+        data = request.data
+        email = data.get("email").lower()
+        password = data.get("password")
+
+        if not email:
+            return Response(
+                {"success": False, "message": "Email is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not password:
+            return Response(
+                {"success": False, "message": "Password is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+            
+
+        try:
+            user_instance = User.objects.get(email=email, is_superuser=True)
+            print(user_instance)
+        except User.DoesNotExist:
+            return Response(
+                {"success": False, "message": "Invalid email or password."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not check_password(password, user_instance.password):
+            return Response(
+                {"success": False, "message": "Invalid email or password."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user_instance.is_active=True
+        user_instance.email_verified=True
+        user_instance.type="Admin"
+        user_instance.save()
+
+        serializer = UserSerializer(user_instance)
+        refresh_token = RefreshToken.for_user(user_instance)
+        access_token = str(refresh_token.access_token)
+        serializer_data_updated=serializer.data
+        
+        serializer_data_updated["is_superuser"]=True
+        # serializer_data_updated["type"]="Admin"
+        
+        return Response(
+            {
+                "success": True,
+                "message": f"{user_instance.email} logged in.",
+                "data": serializer_data_updated,
+                "token": {
+                    "access_token": access_token,
+                    "refresh_token": str(refresh_token),
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+
+class ForgotPasswordViewSet(ModelViewSet):
+    queryset = User.objects.all().order_by("-id")
+    permission_classes = [AllowAny]
+
+    @transaction.atomic()
+    def create(self, request, *args, **kwargs):
+        email = request.data.get("email")
+
+        try:
+            user = User.objects.get(email=email, email_verified=True)
+        except User.DoesNotExist:
+            return Response(
+                {
+                    "success": False,
+                    "message": f"Email {email} is not registered before",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        token = generate_token(user.email, 60)
+        recipient_email = user.email
+        subject = "Reset assword link request from AgelessEatsKitchen.com"
+        context = {"link": f"http://localhost:3000/reset-password/{token}"}
+        template = "send_forgot_password_mail.html"
+        mail_thread = threading.Thread(
+            target=send_email_with_template,
+            args=(subject, recipient_email, template, context),
+        )
+        mail_thread.start()
+
+        return Response(
+            {
+                "success": True,
+                "message": f"Password reset link has been sent on {email}",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class ResetPasswordViewSet(ModelViewSet):
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
+
+    @transaction.atomic()
+    def create(self, request, *args, **kwargs):
+        password = request.data.get("password")
+        token = request.data.get("token")
+        password2 = request.data.get("password2")
+
+        if token is None:
+            return Response(
+                {"success": False, "message": "token is not provided"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            payload = decode_token(token)  # type: ignore
+        except Exception:
+            return Response(
+                {"success": False, "message": "Link expired"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        print("payload", payload)
+        if "email" not in payload:
+            return Response(
+                {"success": False, "message": "Invalid link"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = User.objects.filter(email=payload["email"]).first()
+        if not user:
+            return Response(
+                {"success": False, "message": "Email address not found"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if len(password) < 8 or len(password) > 14:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Password length should be between 8 and 14 characters",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if password != password2:
+            return Response(
+                {"success": False, "message": "Passwords do not match"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user.set_password(password)
+        user.save()
+
+        return Response(
+            {
+                "success": True,
+                "message": f"Password changed successfully for {user.email}",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class ChangePasswordViewSet(ModelViewSet):
+    queryset = User.objects.all().order_by("-id")
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    @transaction.atomic()
+    def create(self, request, *args, **kwargs):
+        user_id = request.user.id
+        password = request.data.get("password")
+        password2 = request.data.get("password2")
+
+        if len(password) < 8 or len(password) > 14:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Password length should be between 8 to 14",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if password != password2:
+            return Response(
+                {
+                    "success": False,
+                    "message": "password and Re-Password is not matching ",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            user = User.objects.get(id=user_id)
+
+        except Exception:
+            return Response(
+                {"success": False, "message": "Email is not Registered"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user.set_password(password)
+        user.save()
+
+        return Response(
+            {"success": True, "message": "Password changed successfully"},
+            status=status.HTTP_200_OK,
+        )
+
+
+class LoginWithGoogleViewSet(ModelViewSet):
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
+
+    @transaction.atomic()
+    def create(self, request, *args, **kwargs):
+        token = request.data.get("token")
+        if token:
+            try:
+                response = requests.get(
+                    f"https://oauth2.googleapis.com/tokeninfo?id_token={token}"
+                )
+
+                if response.status_code == 200:
+                    user_info = response.json()
+                    print(user_info)
+
+                    email = user_info["email"]
+                    username = user_info["name"]
+                    if username is None or username == "":
+                        username = faker("username")
+
+                    username = " ".join(username.split()).replace(" ", "_")
+                    user = User.objects.filter(email=email)
+                    print(user)
+                    if user.exists():
+                        mainuser = user[0]
+                        mainuser.is_active = True
+                        mainuser.save()
+                        refresh_token = RefreshToken.for_user(user[0])
+                        access_token = str(refresh_token.access_token)
+
+                        return Response(
+                            {
+                                "success": True,
+                                "message": "Google authentication Successfully done",
+                                "token": {
+                                    "access_token": access_token,
+                                    "refresh_token": str(refresh_token),
+                                },
+                            },
+                            status=status.HTTP_200_OK,
+                        )
+
+                    else:
+                        user = User.objects.create(email=email, username=username)
+                        user.is_active = True
+                        user.set_password("password@123")
+                        user.email_verified = True
+                        user.save()
+                        refresh_token = RefreshToken.for_user(user)
+                        access_token = str(refresh_token.access_token)
+
+                    # Process user info, create user, or authenticate user as needed
+                    return Response(
+                        {
+                            "success": True,
+                            "message": "Google authentication Successfully done",
+                            "token": {
+                                "access_token": access_token,
+                                "refresh_token": str(refresh_token),
+                            },
+                        },
+                        status=status.HTTP_200_OK,
+                    )
+                else:
+                    return Response(
+                        {"error": "Invalid token"}, status=status.HTTP_400_BAD_REQUEST
+                    )
+
+            except requests.exceptions.RequestException as e:
+                return Response(
+                    {"success": False, "message": "Something went wrong ! try again"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        else:
+            return Response(
+                {"success": False, "message": "Something went wrong ! Try again"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+
+
+    
+    
+    
+    
